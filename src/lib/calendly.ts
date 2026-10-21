@@ -1,0 +1,240 @@
+import crypto from "crypto";
+
+/**
+ * Server-only. Per-client Calendly webhook subscription (spec PHASE 8/9) —
+ * one subscription per client's own organization/user, scoped to their own
+ * access token, so a booking webhook can only ever be about that client's
+ * own leads.
+ */
+export async function createCalendlyWebhookSubscription(params: {
+  accessToken: string;
+  organizationUri: string;
+  userUri: string;
+  callbackUrl: string;
+}): Promise<{ uri: string; signingKey: string }> {
+  const res = await fetch("https://api.calendly.com/webhook_subscriptions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${params.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      url: params.callbackUrl,
+      events: ["invitee.created", "invitee.canceled"],
+      organization: params.organizationUri,
+      user: params.userUri,
+      scope: "user",
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Calendly webhook subscription failed: ${res.status} ${text}`);
+  }
+
+  const data = await res.json();
+  // Calendly returns the signing key only in this creation response — it
+  // must be persisted now, there's no way to retrieve it again later.
+  const signingKey = data.resource?.signing_key as string | undefined;
+  const uri = data.resource?.uri as string | undefined;
+  if (!signingKey || !uri) {
+    throw new Error(`Calendly webhook subscription response missing signing_key/uri: ${JSON.stringify(data)}`);
+  }
+  return { uri, signingKey };
+}
+
+export async function deleteCalendlyWebhookSubscription(accessToken: string, webhookUri: string) {
+  await fetch(webhookUri, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${accessToken}` },
+  }).catch(() => {});
+}
+
+/**
+ * Verifies Calendly's `Calendly-Webhook-Signature` header: "t=<ts>,v1=<hmac>"
+ * — HMAC-SHA256 of "<ts>.<rawBody>" using the subscription's own signing key.
+ */
+export function verifyCalendlySignature(rawBody: string, header: string | null, signingKey: string): boolean {
+  if (!header) return false;
+  const parts = Object.fromEntries(header.split(",").map((p) => p.split("=") as [string, string]));
+  const t = parts.t;
+  const v1 = parts.v1;
+  if (!t || !v1) return false;
+  const expected = crypto.createHmac("sha256", signingKey).update(`${t}.${rawBody}`).digest("hex");
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(v1));
+  } catch {
+    return false;
+  }
+}
+
+interface ClientCalendlyRow {
+  id: string;
+  calendly_access_token: string | null;
+  calendly_refresh_token: string | null;
+  calendly_token_expires_at: string | null;
+  calendly_user_uri: string | null;
+}
+
+/**
+ * Returns a usable access token for this client, refreshing (and persisting
+ * the rotated tokens) when it is expired or about to be. Calendly access
+ * tokens live ~2h — without this, anything that calls the API after the
+ * initial connect silently starts failing with 401.
+ */
+export async function getFreshCalendlyToken(
+  admin: import("@supabase/supabase-js").SupabaseClient,
+  client: ClientCalendlyRow
+): Promise<string | null> {
+  if (!client.calendly_access_token) return null;
+  const expiresAt = client.calendly_token_expires_at ? new Date(client.calendly_token_expires_at).getTime() : 0;
+  if (expiresAt - Date.now() > 120_000) return client.calendly_access_token;
+  if (!client.calendly_refresh_token) return null;
+
+  const res = await fetch("https://auth.calendly.com/oauth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: client.calendly_refresh_token,
+      client_id: process.env.CALENDLY_CLIENT_ID ?? "",
+      client_secret: process.env.CALENDLY_CLIENT_SECRET ?? "",
+    }),
+  });
+  if (!res.ok) return null;
+  const t = (await res.json()) as { access_token?: string; refresh_token?: string; expires_in?: number };
+  if (!t.access_token) return null;
+  await admin
+    .from("clients")
+    .update({
+      calendly_access_token: t.access_token,
+      calendly_refresh_token: t.refresh_token ?? client.calendly_refresh_token,
+      calendly_token_expires_at: t.expires_in ? new Date(Date.now() + t.expires_in * 1000).toISOString() : null,
+    })
+    .eq("id", client.id);
+  return t.access_token;
+}
+
+/** Location kinds Calendly accepts on a one-off event type that need no extra address field. */
+export type MeetingLocationKind = "google_conference" | "zoom_conference" | "microsoft_teams_conference" | "ask_invitee";
+
+/**
+ * Creates a one-off Calendly event type just for one lead (POST /one_off_event_types; scope event_types:write)
+ * so the invite carries OUR tenant's company + conversation topic as its name, and a real meeting location
+ * (Meet/Zoom link generated at booking time) instead of Calendly's generic "appointment" with no location.
+ * Returns the booking URL, or null on ANY failure (plan limits, missing scope, host without the Meet/Zoom
+ * integration...) so the caller falls back to the client's normal calendly_url — never blocks the reply.
+ */
+export async function createLeadMeetingLink(
+  accessToken: string,
+  hostUserUri: string,
+  opts: { name: string; durationMinutes?: number; locationKind?: MeetingLocationKind; daysAhead?: number }
+): Promise<string | null> {
+  const attempt = async (withLocation: boolean): Promise<string | null> => {
+    const res = await fetch("https://api.calendly.com/one_off_event_types", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: opts.name,
+        host: hostUserUri,
+        duration: opts.durationMinutes ?? 30,
+        date_setting: { type: "days_in_future", days: opts.daysAhead ?? 14, only_weekdays: true },
+        ...(withLocation ? { location: { kind: opts.locationKind ?? "google_conference" } } : {}),
+      }),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { resource?: { scheduling_url?: string } };
+    const url = data.resource?.scheduling_url;
+    return url && /^https:\/\//.test(url) ? url : null;
+  };
+  try {
+    // Prefer an event with a real meeting location; if Calendly rejects it (e.g. no Google Meet/Zoom connected on
+    // the host), still give the lead a named, per-lead link rather than the generic one.
+    return (await attempt(true)) ?? (await attempt(false));
+  } catch {
+    return null;
+  }
+}
+
+export interface CalendlyInvitee {
+  inviteeUri: string;
+  email: string;
+  status: string;
+  startTime: string;
+  endTime: string;
+  eventTypeUri: string | null;
+  scheduledEventUri: string;
+  /** Everything below is best-effort — used for the confirmation emails, never required for recording the booking itself. */
+  name?: string | null;
+  timezone?: string | null;
+  cancelUrl?: string | null;
+  rescheduleUrl?: string | null;
+  /** The Calendly Event Type's own (static) name, e.g. "Discovery / Consultation Call". */
+  eventName?: string | null;
+  /** Join link or physical location, flattened to one display string. */
+  location?: string | null;
+}
+
+/** Best-effort flatten of Calendly's `location` object (varies by type: zoom/google_meet/custom/physical/...) to one string. */
+function flattenCalendlyLocation(loc: unknown): string | null {
+  if (!loc || typeof loc !== "object") return null;
+  const l = loc as Record<string, unknown>;
+  return (
+    (typeof l.join_url === "string" && l.join_url) ||
+    (typeof l.location === "string" && l.location) ||
+    (typeof l.data === "object" && l.data && typeof (l.data as Record<string, unknown>).join_url === "string"
+      ? ((l.data as Record<string, unknown>).join_url as string)
+      : null) ||
+    null
+  );
+}
+
+/** Lists invitees of this user's events from `sinceIso` on (works on Calendly's free plan — unlike webhooks). */
+export async function listRecentInvitees(accessToken: string, userUri: string, sinceIso: string): Promise<CalendlyInvitee[]> {
+  const headers = { Authorization: `Bearer ${accessToken}` };
+  const evRes = await fetch(
+    `https://api.calendly.com/scheduled_events?user=${encodeURIComponent(userUri)}&min_start_time=${encodeURIComponent(sinceIso)}&count=100&sort=start_time:asc`,
+    { headers }
+  );
+  if (!evRes.ok) throw new Error(`Calendly scheduled_events failed: ${evRes.status}`);
+  const events = ((await evRes.json()).collection ?? []) as {
+    uri: string;
+    name?: string;
+    start_time: string;
+    end_time: string;
+    event_type: string;
+    location?: unknown;
+  }[];
+  const out: CalendlyInvitee[] = [];
+  for (const ev of events) {
+    const uuid = ev.uri.split("/").pop();
+    const invRes = await fetch(`https://api.calendly.com/scheduled_events/${uuid}/invitees?count=100`, { headers });
+    if (!invRes.ok) continue;
+    for (const inv of ((await invRes.json()).collection ?? []) as {
+      uri: string;
+      email: string;
+      status: string;
+      name?: string;
+      timezone?: string;
+      cancel_url?: string;
+      reschedule_url?: string;
+    }[]) {
+      out.push({
+        inviteeUri: inv.uri,
+        email: inv.email,
+        status: inv.status,
+        startTime: ev.start_time,
+        endTime: ev.end_time,
+        eventTypeUri: ev.event_type ?? null,
+        scheduledEventUri: ev.uri,
+        name: inv.name ?? null,
+        timezone: inv.timezone ?? null,
+        cancelUrl: inv.cancel_url ?? null,
+        rescheduleUrl: inv.reschedule_url ?? null,
+        eventName: ev.name ?? null,
+        location: flattenCalendlyLocation(ev.location),
+      });
+    }
+  }
+  return out;
+}
